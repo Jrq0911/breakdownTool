@@ -121,14 +121,22 @@ def main():
     for _, row in df.iterrows():
         kit_name = str(row['Kit英文名']).strip()
         kit_name_safe = kit_name.replace('/', '_').replace('\\', '_')
-        oss_type = str(row['开闭源']).strip()
+        sub_project = str(row['子项目归属']).strip()
         comp_name_en = str(row['部件英文名称']).strip()
-        
-        # 从 Excel 提取两套关键数据
-        repo_url = str(row['开源仓名称']).strip() if oss_type == '开源' else str(row['闭源仓名称']).strip()
         comp_path = str(row['部件路径']).strip() # L列
         
-        base_dir = oh_root if oss_type == '开源' else hmos_root
+        # 根据 D列 "子项目归属" 判断开闭源及获取对应URL
+        if sub_project == "OPEN_HARMONY":
+            oss_type = "开源"
+            base_dir = oh_root
+            repo_url = str(row['开源仓名称']).strip()
+        elif sub_project == "HARMONY_OS_SDK":
+            oss_type = "闭源"
+            base_dir = hmos_root
+            repo_url = str(row['闭源仓名称']).strip()
+        else:
+            print(f"\n[跳过] {kit_name} -> 未知的归属类型 '{sub_project}'，请检查Excel D列")
+            continue
 
         # --------------------- 分支 A：本地拆解模式 ---------------------
         if IS_LOCAL_MODE:
