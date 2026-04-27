@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenHarmony Kit 部件拆解/下载工具 (双模式版 - 修正目录层级)
+OpenHarmony Kit 部件拆解/下载工具 (双模式解耦版)
+- 默认模式(无 -r): 无视L列，直接Clone J/K列全量仓库
+- 拆解模式(有 -r): 无视J/K列，严格按L列从本地全量仓复制
 """
 
 import os
@@ -19,11 +21,8 @@ def is_git_url(text: str) -> bool:
     return clean_text.startswith("http://") or clean_text.startswith("https://") or clean_text.startswith("git@")
 
 def prepare_asset(target_dir: Path, source: str, branch: str = None):
-    """
-    智能准备资源：自动识别 URL 执行 clone，识别本地路径执行 copy
-    """
+    """智能准备 Docs/SDK：URL克隆，本地路径复制"""
     if not source:
-        # 即使没有来源，文件夹也已经在前面强制建好了，这里只做提示
         print(f"  [跳过] 未提供来源，保持空文件夹: {target_dir.name}")
         return
 
@@ -64,11 +63,11 @@ def main():
     parser.add_argument("-b", "--branch", default=None, help="(可选)指定分支，不存在则回退 master")
     
     parser.add_argument("--oh-docs", default=None, help="开源Docs (填URL克隆 / 填本地路径复制)")
-    parser.add_argument("--oh-sdk-js", default=None, help="开源SDK-JS (填URL克隆 / 填本地路径复制)")
-    parser.add_argument("--oh-sdk-c", default=None, help="开源SDK-C (填URL克隆 / 填本地路径复制)")
-    parser.add_argument("--hmos-docs", default=None, help="闭源Docs (填URL克隆 / 填本地路径复制)")
-    parser.add_argument("--hmos-sdk-js", default=None, help="闭源SDK-JS (填URL克隆 / 填本地路径复制)")
-    parser.add_argument("--hmos-sdk-c", default=None, help="闭源SDK-C (填URL克隆 / 填本地路径复制)")
+    parser.add_argument("--oh-sdk-js", default=None, help="开源SDK-JS")
+    parser.add_argument("--oh-sdk-c", default=None, help="开源SDK-C")
+    parser.add_argument("--hmos-docs", default=None, help="闭源Docs")
+    parser.add_argument("--hmos-sdk-js", default=None, help="闭源SDK-JS")
+    parser.add_argument("--hmos-sdk-c", default=None, help="闭源SDK-C")
     
     args = parser.parse_args()
 
@@ -77,7 +76,7 @@ def main():
     local_repo = Path(args.repo).resolve() if args.repo else None
     
     IS_LOCAL_MODE = True if local_repo else False
-    MODE_TEXT = "【本地全量代码拆解模式】" if IS_LOCAL_MODE else "【默认 Git Clone 下载模式】"
+    MODE_TEXT = "【模式2：本地全量代码拆解 (关注L列)】" if IS_LOCAL_MODE else "【模式1：默认全量下载 (关注J/K列)】"
     
     print("\n" + "="*60)
     print(f" 启动模式: {MODE_TEXT}")
@@ -93,20 +92,17 @@ def main():
 
     oh_root = output_root / "OpenHarmony"
     hmos_root = output_root / "Hmos"
-    clone_cache_dir = output_root / ".git_cache"
 
-    # ==================== 核心修正：强制建立严谨的平行骨架目录 ====================
+    # ==================== 阶段0: 初始化骨架 ====================
     print("\n--- 阶段0: 初始化标准目录骨架 ---")
     for base in [oh_root, hmos_root]:
         (base / "Docs").mkdir(parents=True, exist_ok=True)
         (base / "SDK" / "JS").mkdir(parents=True, exist_ok=True)
         (base / "SDK" / "C").mkdir(parents=True, exist_ok=True)
-    print(f"  [成功] 骨架创建完毕于: {output_root}")
+    print(f"  [成功] 骨架创建完毕")
 
     # ==================== 阶段1: 填充 Docs 和 SDK ====================
-    print("\n--- 阶段1: 准备 Docs 与 SDK (JS/C) ---")
-    
-    # 修正了这里的路径拼接，严格保证是 base/Docs, base/SDK/JS 等
+    print("\n--- 阶段1: 准备 Docs 与 SDK ---")
     assets_config = [
         (oh_root / "Docs", "OpenHarmony/Docs", args.oh_docs),
         (oh_root / "SDK" / "JS", "OpenHarmony/SDK/JS", args.oh_sdk_js),
@@ -115,88 +111,85 @@ def main():
         (hmos_root / "SDK" / "JS", "Hmos/SDK/JS", args.hmos_sdk_js),
         (hmos_root / "SDK" / "C", "Hmos/SDK/C", args.hmos_sdk_c),
     ]
-    
     for target_dir, label, source in assets_config:
         print(f"\n处理 [{label}]...")
         prepare_asset(target_dir, source, args.branch)
 
-    # ==================== 阶段2: 处理 Kit 与 部件 ====================
+    # ==================== 阶段2: 处理 Kit 与 部件 (核心逻辑解耦) ====================
     print("\n--- 阶段2: 处理 Kit 与 部件 ---")
-    repo_cache_map = {} 
 
     for _, row in df.iterrows():
         kit_name = str(row['Kit英文名']).strip()
         kit_name_safe = kit_name.replace('/', '_').replace('\\', '_')
         oss_type = str(row['开闭源']).strip()
         comp_name_en = str(row['部件英文名称']).strip()
-        comp_path = str(row['部件路径']).strip()
+        
+        # 从 Excel 提取两套关键数据
+        repo_url = str(row['开源仓名称']).strip() if oss_type == '开源' else str(row['闭源仓名称']).strip()
+        comp_path = str(row['部件路径']).strip() # L列
         
         base_dir = oh_root if oss_type == '开源' else hmos_root
-        repo_url = str(row['开源仓名称']).strip() if oss_type == '开源' else str(row['闭源仓名称']).strip()
-        
-        if not comp_path or comp_path == 'nan':
-            continue
 
-        target_comp_dir = base_dir / kit_name_safe / comp_path
-        target_comp_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n[{oss_type}] {kit_name} -> {comp_name_en}")
-
+        # --------------------- 分支 A：本地拆解模式 ---------------------
         if IS_LOCAL_MODE:
+            if not comp_path or comp_path == 'nan':
+                continue
+            
+            # 目录结构: OpenHarmony/ArkUI/foundation/arkui/ace_engine/
+            target_comp_dir = base_dir / kit_name_safe / comp_path
+            target_comp_dir.mkdir(parents=True, exist_ok=True)
+            
+            print(f"\n[本地拆解] {kit_name} -> {comp_name_en}")
+            print(f"  读取L列路径: {comp_path}")
+            
             local_comp_path = local_repo / comp_path
             if local_comp_path.exists() and any(local_comp_path.iterdir()):
                 shutil.copytree(local_comp_path, target_comp_dir, dirs_exist_ok=True)
                 print(f"  [成功] 已从本地全量仓复制")
             else:
                 print(f"  [警告] 本地缺失该路径，已跳过。")
+                
+        # --------------------- 分支 B：默认下载模式 ---------------------
         else:
             if not repo_url or repo_url == 'nan':
-                print(f"  [错误] Excel中未提供仓库地址，跳过。")
+                print(f"\n[远程下载] {kit_name} -> {comp_name_en}")
+                print(f"  [跳过] Excel中未提供仓库地址(J/K列)")
                 continue
-
-            if repo_url not in repo_cache_map:
-                repo_name = repo_url.rstrip('/').split('/')[-1]
-                cache_path = clone_cache_dir / repo_name
-                repo_cache_map[repo_url] = cache_path
+            
+            # 目录结构: OpenHarmony/ArkUI/ace_engine/ (直接以部件英文名作为文件夹)
+            target_repo_dir = base_dir / kit_name_safe / comp_name_en
+            
+            print(f"\n[远程下载] {kit_name} -> {comp_name_en}")
+            print(f"  读取J/K列地址: {repo_url}")
+            
+            # 防止同一个 Kit 下的相同部件被重复 clone
+            if target_repo_dir.exists() and any(target_repo_dir.iterdir()):
+                print(f"  [跳过] 该部件目录已存在全量代码")
+                continue
                 
-                branches_to_try = []
-                if args.branch and args.branch.lower() != 'master':
-                    branches_to_try.append(args.branch)
-                branches_to_try.append('master')
+            branches_to_try = []
+            if args.branch and args.branch.lower() != 'master':
+                branches_to_try.append(args.branch)
+            branches_to_try.append('master')
+            
+            clone_success = False
+            for b in branches_to_try:
+                cmd = ['git', 'clone', '--depth', '1']
+                if b: cmd.extend(['-b', b])
+                cmd.extend([repo_url, str(target_repo_dir)])
                 
-                clone_success = False
-                for b in branches_to_try:
-                    cmd = ['git', 'clone', '--depth', '1']
-                    if b: cmd.extend(['-b', b])
-                    cmd.extend([repo_url, str(cache_path)])
-                    
-                    print(f"  [克隆] {repo_name} (分支: {b})")
-                    try:
-                        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
-                        print(f"  [成功] 仓库克隆完成")
-                        clone_success = True
-                        break
-                    except subprocess.CalledProcessError as e:
-                        print(f"  [失败] {e.stderr.strip()}")
-                        if cache_path.exists(): shutil.rmtree(cache_path)
-                
-                if not clone_success:
-                    print(f"  [错误] 仓库下载失败，跳过。")
-                    repo_cache_map[repo_url] = None 
-
-            cached_repo = repo_cache_map[repo_url]
-            if cached_repo and cached_repo.exists():
-                source_in_repo = cached_repo / comp_path
-                if source_in_repo.exists() and any(source_in_repo.iterdir()):
-                    shutil.copytree(source_in_repo, target_comp_dir, dirs_exist_ok=True)
-                    print(f"  [成功] 部件代码提取完成")
-                else:
-                    print(f"  [提示] 未找到子路径，提取仓库根目录。")
-                    shutil.copytree(cached_repo, target_comp_dir, dirs_exist_ok=True)
-
-    if not IS_LOCAL_MODE and clone_cache_dir.exists():
-        shutil.rmtree(clone_cache_dir)
-        print("\n[清理] 已删除临时缓存")
+                print(f"  [克隆] 直接下载全量内容至: {target_repo_dir.name} (分支: {b})")
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                    print(f"  [成功] 仓库全量克隆完成")
+                    clone_success = True
+                    break
+                except subprocess.CalledProcessError as e:
+                    print(f"  [失败] {e.stderr.strip()}")
+                    if target_repo_dir.exists(): shutil.rmtree(target_repo_dir)
+            
+            if not clone_success:
+                print(f"  [错误] 仓库下载彻底失败，跳过。")
 
     print("\n" + "="*60)
     print("✅ 任务执行完毕！")
