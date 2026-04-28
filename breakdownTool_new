@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 OpenHarmony Kit 部件拆解/下载/打包工具 (全自动化多线程版)
-- 支持 Git 账号密码鉴权拉取
+- 支持通过 -x 参数配置网络代理 (支持账密鉴权代理)
 - 支持多线程拆解与打包
 - 自动生成详尽的 Result.log
 """
@@ -17,7 +17,6 @@ import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-import re
 
 # 线程安全的日志打印锁
 log_lock = threading.Lock()
@@ -42,27 +41,26 @@ def fix_git_url(raw_url: str) -> str:
         raw_url += '.git'
     return raw_url
 
-def inject_credentials(url: str, username: str, password: str) -> str:
-    """将账号密码注入到 https URL 中"""
-    if not username or not password:
-        return url
-    # 匹配 https:// 或 http://
-    match = re.match(r'^(https?://)(.*)', url)
-    if match:
-        protocol = match.group(1)
-        rest = match.group(2)
-        # 避免重复注入
-        if "@" not in rest:
-            safe_pwd = password.replace("@", "%40") # 密码中的特殊字符转义
-            return f"{protocol}{username}:{safe_pwd}@{rest}"
-    return url
-
 def is_git_url(text: str) -> bool:
     if not text: return False
     clean_text = text.strip().lower()
     return clean_text.startswith("http://") or clean_text.startswith("https://") or clean_text.startswith("git@")
 
-def prepare_asset(target_dir: Path, source: str, branch: str = None, username: str = None, password: str = None):
+def run_git_cmd(cmd):
+    """封装 Git 命令执行，统一处理代理环境变量注入"""
+    env = os.environ.copy()
+    if proxy_url:
+        env["http_proxy"] = proxy_url
+        env["https_proxy"] = proxy_url
+        # Windows 下 Git 可能也需要这个
+        env["HTTP_PROXY"] = proxy_url
+        env["HTTPS_PROXY"] = proxy_url
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', env=env)
+
+# 全局变量，用于存储代理地址
+proxy_url = None
+
+def prepare_asset(target_dir: Path, source: str, branch: str = None):
     """执行 Git Clone (主线程调用，用于 Docs 和 SDK)"""
     if not source:
         log_msg(f"  [跳过] 未配置地址", is_error=True)
@@ -71,7 +69,6 @@ def prepare_asset(target_dir: Path, source: str, branch: str = None, username: s
     target_dir.mkdir(parents=True, exist_ok=True)
     
     if is_git_url(source):
-        clone_url = inject_credentials(source, username, password)
         branches_to_try = []
         if branch and branch.lower() != 'master':
             branches_to_try.append(branch)
@@ -80,25 +77,23 @@ def prepare_asset(target_dir: Path, source: str, branch: str = None, username: s
         for b in branches_to_try:
             cmd = ['git', 'clone', '--depth', '1']
             if b: cmd.extend(['-b', b])
-            cmd.extend([clone_url, str(target_dir)])
+            cmd.extend([source.strip(), str(target_dir)])
             
             log_msg(f"  [克隆中] 分支: {b}...")
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                run_git_cmd(cmd)
                 log_msg(f"  [成功] 克隆完成")
                 return True
             except subprocess.CalledProcessError as e:
-                # 隐藏带有密码的 URL 日志
-                safe_err = re.sub(r'https?://[^@]+@', 'https://***@', e.stderr.strip())
-                log_msg(f"  [失败] {safe_err}", is_error=True)
+                log_msg(f"  [失败] {e.stderr.strip()}", is_error=True)
                 if target_dir.exists(): shutil.rmtree(target_dir)
-        log_msg(f"  [错误] 无法克隆: {re.sub(r'https?://[^@]+@', 'https://***@', source)}", is_error=True)
+        log_msg(f"  [错误] 无法克隆: {source}", is_error=True)
         return False
     else:
         log_msg(f"  [错误] 配置的地址不是合法的 URL: {source}", is_error=True)
         return False
 
-def process_kit_task(row, local_repo: Path, IS_LOCAL_MODE: bool, output_root: Path, branch: str, username: str, password: str):
+def process_kit_task(row, local_repo: Path, IS_LOCAL_MODE: bool, output_root: Path, branch: str):
     """处理单个 Kit 部件的任务函数 (供多线程调用)"""
     kit_name = str(row['Kit英文名']).strip()
     kit_name_safe = kit_name.replace('/', '_').replace('\\', '_')
@@ -133,15 +128,12 @@ def process_kit_task(row, local_repo: Path, IS_LOCAL_MODE: bool, output_root: Pa
             return (kit_name, comp_name_en, "ERROR", f"本地路径不存在或为空: {local_comp_path}")
             
         try:
-            # 提前确保父目录存在，解决多线程并发创建父目录冲突的问题
             target_comp_dir.mkdir(parents=True, exist_ok=True)
-            # 使用 dirs_exist_ok=True，即使多线程同时复制到同一个Kit下也不会报错
             shutil.copytree(local_comp_path, target_comp_dir, dirs_exist_ok=True)
             log_msg(f"  [成功] 已从本地全量仓复制")
             return (kit_name, comp_name_en, "SUCCESS", "")
         except Exception as e:
             log_msg(f"  [失败] 复制过程报错: {e}", is_error=True)
-            # 【关键修复】：一旦报错，必须返回 ERROR 状态，防止被误判为成功
             return (kit_name, comp_name_en, "ERROR", f"复制异常: {str(e)}")
     else:
         if not repo_url or repo_url == 'nan':
@@ -155,7 +147,6 @@ def process_kit_task(row, local_repo: Path, IS_LOCAL_MODE: bool, output_root: Pa
             log_msg(f"  [跳过] 目录已存在")
             return (kit_name, comp_name_en, "SKIP", "目标目录已存在")
             
-        clone_url = inject_credentials(repo_url, username, password)
         branches_to_try = []
         if branch and branch.lower() != 'master':
             branches_to_try.append(branch)
@@ -164,15 +155,14 @@ def process_kit_task(row, local_repo: Path, IS_LOCAL_MODE: bool, output_root: Pa
         for b in branches_to_try:
             cmd = ['git', 'clone', '--depth', '1']
             if b: cmd.extend(['-b', b])
-            cmd.extend([clone_url, str(target_repo_dir)])
+            cmd.extend([repo_url, str(target_repo_dir)])
             log_msg(f"  [克隆] 分支: {b}...")
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
+                run_git_cmd(cmd)
                 log_msg(f"  [成功] 仓库克隆完成")
                 return (kit_name, comp_name_en, "SUCCESS", "")
             except subprocess.CalledProcessError as e:
-                safe_err = re.sub(r'https?://[^@]+@', 'https://***@', e.stderr.strip())
-                log_msg(f"  [失败] {safe_err}", is_error=True)
+                log_msg(f"  [失败] {e.stderr.strip()}", is_error=True)
                 if target_repo_dir.exists(): shutil.rmtree(target_repo_dir)
                 
         log_msg(f"  [错误] 仓库下载失败", is_error=True)
@@ -186,8 +176,6 @@ def zip_kit_task(kit_dir: Path):
     zip_path = kit_dir / f"{kit_dir.name}.zip"
     
     try:
-        # 【核心修复】：先收集要打包的文件列表，并绝对排除所有 .zip 文件
-        # 这样既不会读到别的线程正在生成的包，也不会读到历史遗留的包
         files_to_zip = [
             f for f in kit_dir.rglob('*') 
             if f.is_file() and f.suffix.lower() != '.zip'
@@ -202,7 +190,6 @@ def zip_kit_task(kit_dir: Path):
                     arcname = file_path.relative_to(kit_dir.parent)
                     zipf.write(file_path, arcname)
                 except PermissionError:
-                    # 遇到无权限的特殊文件直接跳过，防止卡死当前线程
                     log_msg(f"    [警告] 跳过无权限文件: {file_path.name}", is_error=True)
                 except Exception as e:
                     log_msg(f"    [警告] 跳过异常文件: {file_path.name} ({e})", is_error=True)
@@ -212,21 +199,21 @@ def zip_kit_task(kit_dir: Path):
         return (kit_dir.name, "ERROR", str(e))
 
 def main():
-    global log_file_path
+    global log_file_path, proxy_url
     
-    parser = argparse.ArgumentParser(description="Kit部件拆解/下载/打包工具 (多线程+日志+鉴权)")
+    parser = argparse.ArgumentParser(description="Kit部件拆解/下载/打包工具 (多线程+日志+代理)")
     parser.add_argument("-e", "--excel", required=True, help="Kit部件映射 Excel 文件路径")
     parser.add_argument("-o", "--output", required=True, help="输出根目录")
     parser.add_argument("-r", "--repo", default=None, help="(可选)本地全量代码仓路径。提供则本地拆解，不提供则Git下载")
     parser.add_argument("-b", "--branch", default=None, help="(可选)指定分支，不存在则回退 master")
     parser.add_argument("-t", "--threads", type=int, default=4, help="(可选)拆解/打包的并发线程数，默认 4")
-    parser.add_argument("-u", "--username", default=None, help="(可选)Git拉取账号(用于闭源仓等需要鉴权的仓库)")
-    parser.add_argument("-p", "--password", default=None, help="(可选)Git拉取密码")
+    parser.add_argument("-x", "--proxy", default=None, help="(可选)配置网络代理，格式如: http://ip:port 或带鉴权 http://user:pass@ip:port")
     args = parser.parse_args()
 
     output_root = Path(args.output).resolve()
     excel_path = Path(args.excel).resolve()
     local_repo = Path(args.repo).resolve() if args.repo else None
+    proxy_url = args.proxy
     
     IS_LOCAL_MODE = True if local_repo else False
     MODE_TEXT = "【模式2：本地全量拆解】" if IS_LOCAL_MODE else "【模式1：默认全量下载】"
@@ -238,8 +225,18 @@ def main():
     
     print("\n" + "="*60)
     log_msg(f" 启动模式: {MODE_TEXT} | 并发线程数: {args.threads}")
-    if args.username:
-        log_msg(f" Git 鉴权: 已配置用户名 ({args.username})")
+    if proxy_url:
+        # 隐藏代理中的账密进行日志打印
+        safe_proxy = proxy_url
+        if '@' in proxy_url:
+            parts = proxy_url.split('://')
+            if len(parts) == 2:
+                auth_host = parts[1].split('@')
+                safe_proxy = f"{parts[0]}://***:***@{auth_host[1]}"
+        log_msg(f" 网络代理: 已配置 ({safe_proxy})")
+    else:
+        log_msg(f" 网络代理: 未配置 (使用本机默认网络)")
+        
     if IS_LOCAL_MODE and not local_repo.exists():
         log_msg(f"错误: 本地代码仓不存在 -> {local_repo}", is_error=True)
         sys.exit(1)
@@ -265,17 +262,17 @@ def main():
 
     # ==================== 阶段1: 处理 Docs 和 SDK ====================
     log_msg("\n--- 阶段1: 处理 Docs 和 SDK ---")
-    prepare_asset(oh_root / "Docs", "https://gitee.com/openharmony/docs.git", args.branch, args.username, args.password)
-    prepare_asset(hmos_root / "Docs", fix_git_url("https://cr-y.codehub.huawei.com/CBG_CR/huawei/HarmonyOS_Docs/-/home"), args.branch, args.username, args.password)
+    #prepare_asset(oh_root / "Docs", "https://gitcode.com/openharmony/docs.git", args.branch)
+    #prepare_asset(hmos_root / "Docs", fix_git_url("https://cr-y.codehub.huawei.com/CBG_CR/huawei/HarmonyOS_Docs/-/home"), args.branch)
 
     if IS_LOCAL_MODE:
         log_msg("\n--- 阶段1.1: 处理 SDK (本地模式) ---")
         sdk_local_map = {
-            oh_root / "SDK" / "JS": "/code/interface/sdk-js",
-            oh_root / "SDK" / "C": "/code/interface/sdk_c",
-            oh_root / "SDK" / "Cangjie": "/code/interface/sdk_cangjie",
-            hmos_root / "SDK" / "JS": "/code/vendor/huawei/interface/hmscore_sdk_js",
-            hmos_root / "SDK" / "C": "/code/vendor/huawei/interface/hmscore_sdk_c",
+            oh_root / "SDK" / "JS": "/interface/sdk-js",
+            oh_root / "SDK" / "C": "/interface/sdk_c",
+            oh_root / "SDK" / "Cangjie": "/interface/sdk_cangjie",
+            hmos_root / "SDK" / "JS": "/vendor/huawei/interface/hmscore_sdk_js",
+            hmos_root / "SDK" / "C": "/vendor/huawei/interface/hmscore_sdk_c",
         }
         for target_dir, rel_path in sdk_local_map.items():
             log_msg(f"\n处理 [{target_dir.relative_to(output_root)}]...")
@@ -297,22 +294,20 @@ def main():
         for target_dir, raw_url in sdk_url_map.items():
             log_msg(f"\n处理 [{target_dir.relative_to(output_root)}]...")
             real_clone_url = fix_git_url(raw_url)
-            prepare_asset(target_dir, real_clone_url, args.branch, args.username, args.password)
+            prepare_asset(target_dir, real_clone_url, args.branch)
 
     # ==================== 阶段2: 多线程处理 Kit 与 部件 ====================
     log_msg("\n--- 阶段2: 多线程处理 Kit 与 部件 ---")
     results = []
     
-    # 使用线程池并发处理 Excel 中的每一行
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = {
-            executor.submit(process_kit_task, row, local_repo, IS_LOCAL_MODE, output_root, args.branch, args.username, args.password): idx
+            executor.submit(process_kit_task, row, local_repo, IS_LOCAL_MODE, output_root, args.branch): idx
             for idx, row in df.iterrows()
         }
         for future in as_completed(futures):
             results.append(future.result())
 
-    # 汇总日志
     success_count = sum(1 for r in results if r[2] == "SUCCESS")
     error_count = sum(1 for r in results if r[2] == "ERROR")
     skip_count = sum(1 for r in results if r[2] == "SKIP")
@@ -337,7 +332,6 @@ def main():
     zip_results = []
     if kit_dirs:
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            # 【修改点】：不再传递 output_root 参数
             futures = [executor.submit(zip_kit_task, kd) for kd in kit_dirs]
             for future in as_completed(futures):
                 zip_results.append(future.result())
