@@ -183,17 +183,30 @@ def zip_kit_task(kit_dir: Path):
     if not kit_dir.exists() or not any(kit_dir.iterdir()):
         return (kit_dir.name, "SKIP", "目录为空或不存在")
     
-    # 【修改点】：将 zip 的输出路径设定为 Kit 目录的内部
     zip_path = kit_dir / f"{kit_dir.name}.zip"
     
     try:
+        # 【核心修复】：先收集要打包的文件列表，并绝对排除所有 .zip 文件
+        # 这样既不会读到别的线程正在生成的包，也不会读到历史遗留的包
+        files_to_zip = [
+            f for f in kit_dir.rglob('*') 
+            if f.is_file() and f.suffix.lower() != '.zip'
+        ]
+        
+        if not files_to_zip:
+            return (kit_dir.name, "SKIP", "目录内没有可打包的有效文件")
+            
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in kit_dir.rglob('*'):
-                # 排除正在生成的这个 zip 文件自身，防止死循环或压缩包套压缩包
-                if file_path.is_file() and file_path != zip_path:
-                    # 打包内的相对路径以 Kit 文件夹为基准（例如：Multimedia_Kit/Player/xxx.js）
+            for file_path in files_to_zip:
+                try:
                     arcname = file_path.relative_to(kit_dir.parent)
                     zipf.write(file_path, arcname)
+                except PermissionError:
+                    # 遇到无权限的特殊文件直接跳过，防止卡死当前线程
+                    log_msg(f"    [警告] 跳过无权限文件: {file_path.name}", is_error=True)
+                except Exception as e:
+                    log_msg(f"    [警告] 跳过异常文件: {file_path.name} ({e})", is_error=True)
+                    
         return (kit_dir.name, "SUCCESS", "")
     except Exception as e:
         return (kit_dir.name, "ERROR", str(e))
